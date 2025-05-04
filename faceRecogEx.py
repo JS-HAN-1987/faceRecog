@@ -3,7 +3,7 @@ import shutil
 import numpy as np
 import cv2
 import tensorflow as tf
-from tensorflow.keras.models import Model
+from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling2D, Dropout
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.preprocessing.image import img_to_array
@@ -19,6 +19,8 @@ from mtcnn import MTCNN
 TRAIN_DIR = "train"
 SAMPLE_DIR = "sample"
 OUTPUT_DIR = os.path.join(SAMPLE_DIR)
+MODEL_PATH = os.path.join(OUTPUT_DIR, "face_recognition_model.h5")
+LABEL_ENCODER_PATH = os.path.join(OUTPUT_DIR, "label_encoder.npy")
 
 # 얼굴 감지기 초기화
 detector = MTCNN()
@@ -181,64 +183,115 @@ def load_dataset():
     return np.array(faces), np.array(labels)
 
 
-def build_model(input_shape, num_classes):
-    """얼굴 인식 모델을 구축합니다."""
-    # MobileNetV2를 기본 모델로 사용
-    base_model = MobileNetV2(
-        weights='imagenet',
-        include_top=False,
-        input_shape=input_shape
-    )
+def load_existing_model():
+    """기존에 저장된 모델을 로드합니다."""
+    if not os.path.exists(MODEL_PATH):
+        print(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
+        return None, None
 
-    # 커스텀 레이어 추가
-    x = base_model.output
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(256, activation='relu')(x)  # 노드 증가
-    x = Dropout(0.5)(x)
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.3)(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
+    if not os.path.exists(LABEL_ENCODER_PATH):
+        print(f"라벨 인코더 파일을 찾을 수 없습니다: {LABEL_ENCODER_PATH}")
+        return None, None
 
-    # 모델 생성
-    model = Model(inputs=base_model.input, outputs=outputs)
+    try:
+        # 모델 로드
+        model = load_model(MODEL_PATH)
+        print(f"모델을 성공적으로 로드했습니다: {MODEL_PATH}")
 
-    # 기본 모델 레이어 고정 (이후 미세 조정 가능)
-    for layer in base_model.layers:
-        layer.trainable = False
+        # 라벨 인코더 로드
+        label_classes = np.load(LABEL_ENCODER_PATH, allow_pickle=True)
+        label_encoder = LabelEncoder()
+        label_encoder.classes_ = label_classes
+        print(f"라벨 인코더를 성공적으로 로드했습니다. 클래스: {label_classes}")
 
-    return model
+        return model, label_encoder
+    except Exception as e:
+        print(f"모델 로드 중 오류 발생: {e}")
+        return None, None
 
 
-def train_classifier():
-    """얼굴 인식 분류기를 학습시킵니다."""
-    # 데이터셋 로드
+def retrain_model():
+    """기존 모델을 로드하고 새로운 데이터로 추가 학습합니다."""
+    # 기존 모델 로드
+    model, label_encoder = load_existing_model()
+
+    # 모델이 없으면 종료
+    if model is None:
+        print("기존 모델을 로드할 수 없어 추가 학습을 진행할 수 없습니다.")
+        return None, None
+
+    # 새 데이터 로드
     faces, labels = load_dataset()
 
     if len(faces) == 0:
-        print("학습 데이터가 없습니다. 학습을 진행할 수 없습니다.")
-        return None, None
+        print("학습할 새 데이터가 없습니다.")
+        return model, label_encoder
 
     print(f"로드된 얼굴 이미지: {len(faces)}")
 
+    # 새 클래스 확인 및 처리
+    existing_classes = set(label_encoder.classes_)
+    new_labels = set(labels)
+
+    # 새로운 클래스가 있는지 확인
+    if not new_labels.issubset(existing_classes):
+        print("새로운 클래스가 발견되었습니다. 모델을 재구성해야 합니다.")
+        # 새 클래스를 포함한 라벨 인코더 생성
+        all_classes = sorted(list(existing_classes.union(new_labels)))
+        new_label_encoder = LabelEncoder()
+        new_label_encoder.classes_ = np.array(all_classes)
+
+        # 기존 모델의 출력층 가중치와 편향 저장
+        old_output_layer = model.layers[-1]
+        old_weights = old_output_layer.get_weights()[0]  # 가중치
+        old_biases = old_output_layer.get_weights()[1]  # 편향
+
+        # 이전 레이어의 출력 크기 확인
+        prev_layer_output = model.layers[-2].output_shape[-1]
+
+        # 새 출력층 생성 (기존 모델의 마지막 레이어 제거)
+        x = model.layers[-3].output
+        new_outputs = Dense(len(all_classes), activation='softmax')(x)
+
+        # 새 모델 생성
+        new_model = Model(inputs=model.input, outputs=new_outputs)
+
+        # 이전 가중치 복사 (기존 클래스에 대해서만)
+        new_output_layer = new_model.layers[-1]
+        new_weights = new_output_layer.get_weights()[0]  # 새 가중치
+        new_biases = new_output_layer.get_weights()[1]  # 새 편향
+
+        # 기존 클래스에 대한 가중치 복사
+        for i, cls in enumerate(label_encoder.classes_):
+            new_idx = np.where(new_label_encoder.classes_ == cls)[0][0]
+            new_weights[:, new_idx] = old_weights[:, i]
+            new_biases[new_idx] = old_biases[i]
+
+        # 새 가중치 설정
+        new_output_layer.set_weights([new_weights, new_biases])
+
+        # 새 모델로 업데이트
+        model = new_model
+        label_encoder = new_label_encoder
+
     # 라벨 인코딩
-    label_encoder = LabelEncoder()
-    encoded_labels = label_encoder.fit_transform(labels)
+    encoded_labels = label_encoder.transform(labels)
 
     # 데이터셋 분할
     X_train, X_test, y_train, y_test = train_test_split(
         faces, encoded_labels, test_size=0.2, random_state=42, stratify=encoded_labels
     )
 
-    # 모델 구축
-    num_classes = len(label_encoder.classes_)
-    model = build_model((160, 160, 3), num_classes)
-
     # 모델 컴파일
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),  # 낮은 학습률로 미세조정
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
+
+    # 기존 모델의 모든 레이어 훈련 가능하게 설정 (미세조정)
+    for layer in model.layers:
+        layer.trainable = True
 
     # 데이터 증강 설정
     datagen = create_data_generator()
@@ -252,7 +305,7 @@ def train_classifier():
     )
 
     # 모델 체크포인트 설정
-    checkpoint_path = os.path.join(OUTPUT_DIR, "model_checkpoint.h5")
+    checkpoint_path = os.path.join(OUTPUT_DIR, "model_checkpoint_retrained.h5")
     model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
         checkpoint_path,
         monitor='val_accuracy',
@@ -261,11 +314,11 @@ def train_classifier():
         verbose=1
     )
 
-    # 모델 학습 (데이터 증강 사용)
+    # 모델 추가 학습 (데이터 증강 사용)
     history = model.fit(
         datagen.flow(X_train, y_train, batch_size=32),
         validation_data=(X_test, y_test),
-        epochs=30,  # 더 긴 훈련
+        epochs=20,  # 추가 학습은 더 적은 에폭
         callbacks=[early_stopping, model_checkpoint],
         steps_per_epoch=len(X_train) // 32
     )
@@ -304,14 +357,14 @@ def train_classifier():
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "training_history.png"))
+    plt.savefig(os.path.join(OUTPUT_DIR, "retraining_history.png"))
     plt.close()
 
-    # 모델 저장
-    model.save(os.path.join(OUTPUT_DIR, "face_recognition_model.h5"))
+    # 재훈련된 모델 저장
+    model.save(os.path.join(OUTPUT_DIR, "face_recognition_model_retrained.h5"))
 
-    # 학습된 라벨 저장
-    np.save(os.path.join(OUTPUT_DIR, "label_encoder.npy"), label_encoder.classes_)
+    # 업데이트된 라벨 저장
+    np.save(os.path.join(OUTPUT_DIR, "label_encoder_updated.npy"), label_encoder.classes_)
 
     return model, label_encoder
 
@@ -400,14 +453,14 @@ def classify_faces(model, label_encoder):
 
 
 def main():
-    print("=== 자녀 얼굴 인식 및 사진 분류 프로그램 ===")
+    print("=== 자녀 얼굴 인식 및 사진 분류 프로그램 (추가 학습) ===")
 
-    # 모델 학습
-    print("\n1. 얼굴 인식 모델 학습 중...")
-    model, label_encoder = train_classifier()
+    # 기존 모델 추가 학습
+    print("\n1. 기존 얼굴 인식 모델 로드 및 추가 학습 중...")
+    model, label_encoder = retrain_model()
 
     if model is None:
-        print("모델 학습에 실패했습니다.")
+        print("모델 추가 학습에 실패했습니다.")
         return
 
     # 얼굴 분류
@@ -416,6 +469,7 @@ def main():
 
     print("\n분류 완료!")
     print(f"결과는 {OUTPUT_DIR} 폴더에 저장되었습니다.")
+    print(f"재학습된 모델은 {os.path.join(OUTPUT_DIR, 'face_recognition_model_retrained.h5')}에 저장되었습니다.")
 
 
 if __name__ == "__main__":
